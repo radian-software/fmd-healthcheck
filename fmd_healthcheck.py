@@ -4,13 +4,11 @@ import base64
 from datetime import datetime, timedelta
 import json
 import os
+from typing import Any
 
-from cryptography.hazmat.primitives.asymmetric.padding import MGF1, OAEP
-from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.hazmat.primitives.hashes import SHA256
+from cryptography.hazmat.primitives.hashes import Hash, SHA256
 from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
-from cryptography.hazmat.primitives.serialization import load_pem_private_key
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 import dotenv
 import requests
 
@@ -26,91 +24,59 @@ healthcheck_url = os.environ["FMD_HEALTHCHECK_URL"]
 session = requests.Session()
 
 
-def request(method: str, route: str, idt: str, data: str = "unused") -> str:
+def request(method: str, route: str, data: Any = None, headers: Any = None) -> Any:
     resp = session.request(
         method,
-        f"https://{hostname}/api/v1/{route}",
-        json={
-            "Data": data,
-            "IDT": idt,
-        },
+        f"https://{hostname}/api/v2/{route}",
+        json=data,
+        headers=headers,
     )
     resp.raise_for_status()
-    return resp.json()["Data"]
+    return resp.json()
 
 
-def base64_decode(data: str) -> bytes:
-    return base64.b64decode(data + "==")
+username_hash = Hash.hash(SHA256(), username.encode())
 
+salt_resp = request("GET", f"account/{username}/salt")
+if salt_resp["protoVersion"] != 2:
+    raise RuntimeError(f"Unexpected salt response: {salt_resp}")
+password_salt = base64.b64decode(salt_resp["salt64"])
 
-password_salt = base64_decode(request("PUT", "salt", username))
-
-authentication_kdf = Argon2id(
+password_key = Argon2id(
     salt=password_salt,
     length=32,
     iterations=1,
     lanes=4,
     memory_cost=131072,
+).derive(b"fmd_v2_password" + username_hash + password.encode())
+
+auth_key = HKDF(
+    SHA256(), length=32, salt=None, info=b"fmd_v2_auth" + username_hash
+).derive(password_key)
+
+auth_resp = request(
+    "POST",
+    "account/login",
+    data={
+        "username": username,
+        "passwordHash64": base64.b64encode(auth_key).decode(),
+        "sessionDurationSeconds": 60,
+    },
 )
 
-authentication_symmetric_key = authentication_kdf.derive_phc_encoded(
-    b"context:loginAuthentication" + password.encode()
+access_token = auth_resp["accessToken"]
+
+locations_resp = request(
+    "GET",
+    "data/location",
+    headers={
+        "authorization": f"Bearer {access_token}",
+    },
 )
 
-session_token = request(
-    "put",
-    "requestAccess",
-    username,
-    authentication_symmetric_key,
+last_update_time = datetime.fromtimestamp(
+    max(item["unixMillis"] for item in locations_resp["items"]) / 1000
 )
-
-encrypted_private_key = base64.b64decode(request("PUT", "key", session_token))
-
-private_key_salt = encrypted_private_key[:16]
-private_key_iv = encrypted_private_key[16:28]
-private_key_ciphertext = encrypted_private_key[28:]
-
-decryption_kdf = Argon2id(
-    salt=private_key_salt,
-    length=32,
-    iterations=1,
-    lanes=4,
-    memory_cost=131072,
-)
-
-decryption_symmetric_key = decryption_kdf.derive(
-    b"context:asymmetricKeyWrap" + password.encode()
-)
-
-private_key = load_pem_private_key(
-    AESGCM(decryption_symmetric_key).decrypt(
-        private_key_iv, private_key_ciphertext, associated_data=None
-    ),
-    password=None,
-)
-assert isinstance(private_key, RSAPrivateKey)
-
-location_size = int(request("PUT", "locationDataSize", session_token))
-
-encrypted_location = base64_decode(
-    request("put", "location", session_token, str(location_size - 1))
-)
-
-encrypted_location_key = encrypted_location[:384]
-location_iv = encrypted_location[384:396]
-location_ciphertext = encrypted_location[396:]
-
-location_key = private_key.decrypt(
-    encrypted_location_key, OAEP(MGF1(SHA256()), SHA256(), label=None)
-)
-
-location = json.loads(
-    AESGCM(location_key).decrypt(location_iv, location_ciphertext, associated_data=None)
-)
-
-# https://gitlab.com/fmd-foss/fmd-android/-/blob/81d8f1550f587b75488e0edf10e0ee48e65e0fc0/app/src/main/java/de/nulide/findmydevice/net/FMDServerApiRepository.kt#L649
-# https://docs.oracle.com/javase/8/docs/api/java/util/Date.html#toString--
-last_update_time = datetime.strptime(location["time"], "%a %b %d %H:%M:%S %Z %Y")
 last_update_age = datetime.now() - last_update_time
 
 if last_update_age > allowed_age:
